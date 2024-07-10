@@ -6,13 +6,15 @@ import torch.nn.functional as F
 import flwr as fl
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, random_split
+import numpy as np
+import pickle
 
 class CNN(nn.Module):
     def __init__(self):
         super(CNN, self).__init__()
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.fc1 = nn.Linear(64*14*14, 128)  
+        self.fc1 = nn.Linear(64*7*7, 128)  # Adjusted input size for MNIST
         self.fc2 = nn.Linear(128, 10)
 
     def forward(self, x):
@@ -20,7 +22,7 @@ class CNN(nn.Module):
         x = F.max_pool2d(x, 2, 2)
         x = F.relu(self.conv2(x))
         x = F.max_pool2d(x, 2, 2)
-        x = x.view(-1, 64*14*14)  
+        x = x.view(-1, 64*7*7)  # Adjusted input size for MNIST
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
         return F.log_softmax(x, dim=1)
@@ -38,16 +40,24 @@ def load_datasets():
 def encrypt_parameters(parameters, context):
     encrypted_parameters = []
     for param in parameters:
-        encrypted_tensor = ts.ckks_vector(context, param)
-        encrypted_parameters.append(encrypted_tensor)
+        param_flat = param.flatten().tolist()  # Flatten the tensor to a list
+        encrypted_tensor = ts.ckks_vector(context, param_flat)
+        encrypted_parameters.append((encrypted_tensor.serialize(), param.shape))  # Store the shape for later use
     return encrypted_parameters
 
 def decrypt_parameters(encrypted_parameters, context):
     decrypted_parameters = []
-    for enc_param in encrypted_parameters:
-        decrypted_tensor = enc_param.decrypt()
+    for enc_param, shape in encrypted_parameters:
+        enc_param = ts.ckks_vector_from(context, enc_param)
+        decrypted_tensor = torch.tensor(enc_param.decrypt()).reshape(shape)  # Reshape to the original shape
         decrypted_parameters.append(decrypted_tensor)
     return decrypted_parameters
+
+def serialize_parameters(parameters):
+    return pickle.dumps(parameters)
+
+def deserialize_parameters(serialized_parameters):
+    return pickle.loads(serialized_parameters)
 
 def client_fn(partition_id):
     partitions, _ = load_datasets()
@@ -62,12 +72,16 @@ def client_fn(partition_id):
     context.generate_galois_keys()
 
     class FlowerClient(fl.client.NumPyClient):
-        def get_parameters(self):
+        def get_parameters(self, config=None):
             parameters = [val.cpu().numpy() for val in model.state_dict().values()]
-            return encrypt_parameters(parameters, context)
+            encrypted_params = encrypt_parameters(parameters, context)
+            serialized_params = serialize_parameters(encrypted_params)
+            return [np.frombuffer(serialized_params, dtype=np.uint8)]
 
         def set_parameters(self, parameters):
-            decrypted_params = decrypt_parameters(parameters, context)
+            serialized_params = parameters[0].tobytes()
+            encrypted_params = deserialize_parameters(serialized_params)
+            decrypted_params = decrypt_parameters(encrypted_params, context)
             params_dict = zip(model.state_dict().keys(), decrypted_params)
             state_dict = {k: torch.tensor(v) for k, v in params_dict}
             model.load_state_dict(state_dict, strict=True)
