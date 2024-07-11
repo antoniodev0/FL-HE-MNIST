@@ -83,13 +83,13 @@ def client_fn(partition_id):
             encrypted_params = deserialize_parameters(serialized_params)
             decrypted_params = decrypt_parameters(encrypted_params, context)
             params_dict = zip(model.state_dict().keys(), decrypted_params)
-            state_dict = {k: torch.tensor(v) for k, v in params_dict}
+            state_dict = {k: v.clone().detach() for k, v in params_dict}  # Updated line
             model.load_state_dict(state_dict, strict=True)
 
         def fit(self, parameters, config):
             self.set_parameters(parameters)
             model.train()
-            for epoch in range(1):
+            for epoch in range(3):  # Aumenta il numero di epoche a 3
                 for batch_idx, (data, target) in enumerate(train_loader):
                     optimizer.zero_grad()
                     output = model(data)
@@ -119,4 +119,7 @@ if __name__ == "__main__":
     parser.add_argument("--partition-id", type=int, required=True, help="Partition ID")
     args = parser.parse_args()
 
-    fl.client.start_numpy_client(server_address="localhost:8080", client=client_fn(args.partition_id))
+    fl.client.start_client(
+        server_address="localhost:8080",
+        client=client_fn(args.partition_id).to_client(),
+    )
