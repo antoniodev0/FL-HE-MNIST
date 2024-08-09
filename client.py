@@ -1,142 +1,207 @@
-import argparse
-import tenseal as ts
+import flwr as fl
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import flwr as fl
+import torch.optim as optim
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Dataset
 import numpy as np
 import pickle
-from tqdm import tqdm
+import tenseal as ts
+import argparse
+import logging
+from flwr.common import (
+    Code,
+    EvaluateIns,
+    EvaluateRes,
+    FitIns,
+    FitRes,
+    GetParametersIns,
+    GetParametersRes,
+    Status,
+    MetricsAggregationFn,
+    NDArrays,
+    Parameters,
+    Scalar,
+    ndarrays_to_parameters,
+    parameters_to_ndarrays,
+)
 
-class CNN(nn.Module):
+public_context = pickle.load(open("public_context.pkl", "rb"))
+secret_context = pickle.load(open("secret_context.pkl", "rb"))
+
+context = ts.context_from(secret_context)
+context.make_context_public()
+public_context = context.serialize()
+
+# Check if a variable is a list or a np.ndarray
+def isList(arrayList):
+    return isinstance(arrayList, (list, np.ndarray))
+
+# Encrypt data function
+def cipher(values, context):
+    tempValues = []
+    for i in range(len(values)):
+        if isList(values[i]):
+            tempValues.append(cipher(values[i], context))
+        else:
+            encrypt = ts.ckks_vector(context, values)
+            encrypt = encrypt.serialize()
+            return encrypt
+    return tempValues
+
+# Decrypt data function
+def plain(values, context):
+    tempValues = values
+    for i in range(len(values)):
+        if isList(values[i]):
+            plain(values[i], context)
+        else:
+            if type(values[i]) == ts.tensors.ckksvector.CKKSVector:
+                values[i].link_context(context)
+                tempValues[i] = values[i].decrypt()
+    return tempValues
+
+# Deserialize data to get bytes
+def deserializeToBytes(values):
+    tempValues = []
+    for i in range(len(values)):
+        if isList(values[i]):
+            if len(values[i].shape) == 0:
+                tempValues.append(values[i].tobytes())
+            else:
+                tempValues.append(deserializeToBytes(values[i]))
+        else:
+            tmp = []
+            for elem in values:
+                tmp.append(elem.tobytes())
+            return tmp
+    return tempValues
+
+# Deserialize data function
+def deserialize(values, context):
+    tempValues = values
+    for i in range(len(values)):
+        if isList(values[i]):
+            deserialize(values[i], context)
+        elif type(values[i]) == bytes:
+            deser = ts.ckks_vector_from(context, values[i])
+            tempValues[i] = deser
+    return tempValues
+
+# Evaluate model
+def evaluate_model(model: torch.nn.Module, testloader: DataLoader, criterion: torch.nn.Module, device: torch.device) -> tuple[float, float]:
+    model.eval()
+    correct = 0
+    total = 0
+    running_loss = 0.0
+    with torch.no_grad():
+        for data, labels in testloader:
+            data, labels = data.to(device), labels.to(device)
+            outputs = model(data)
+            loss = criterion(outputs, labels)
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    accuracy = correct / total
+    loss = running_loss / len(testloader)
+    return loss, accuracy
+
+# Define the model
+class Net(nn.Module):
     def __init__(self):
-        super(CNN, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.fc1 = nn.Linear(64*14*14, 128)
-        self.fc2 = nn.Linear(128, 10)
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 6, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+        self.fc1 = nn.Linear(16 * 4 * 4, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, 10)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.max_pool2d(F.relu(self.conv2(x)), 2)
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        x = self.fc2(x)
-        return F.log_softmax(x, dim=1)
+        x = self.pool(nn.functional.relu(self.conv1(x)))
+        x = self.pool(nn.functional.relu(self.conv2(x)))
+        x = x.view(-1, 16 * 4 * 4)
+        x = nn.functional.relu(self.fc1(x))
+        x = nn.functional.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
 
-def load_datasets(partition_id):
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
-    ])
-    train_dataset = datasets.MNIST(root='data', train=True, download=True, transform=transform)
-    test_dataset = datasets.MNIST(root='data', train=False, download=True, transform=transform)
+# Flower client
+class FlowerClient(fl.client.NumPyClient):
+    def __init__(self, cid, trainloader, testloader, net, criterion, optimizer) -> None:
+        self.cid = cid
+        self.trainloader = trainloader
+        self.testloader = testloader
+        self.net = net
+        self.criterion = criterion
+        self.optimizer = optimizer
 
-    partition_size = len(train_dataset) // 5
-    partitions = random_split(train_dataset, [partition_size] * 5)
+    def get_parameters(self, config):
+        logging.debug(f"[Client {self.cid}] get_parameters")
+        ndarrays = [param.cpu().detach().numpy() for param in self.net.parameters()]
+        encryptedParameters = cipher(ndarrays, ts.context_from(public_context))
+        return encryptedParameters
 
-    client_dataset = partitions[partition_id]
-    train_size = int(0.8 * len(client_dataset))
-    val_size = len(client_dataset) - train_size
-    train_dataset, val_dataset = random_split(client_dataset, [train_size, val_size])
+    def set_parameters(self, parameters: Parameters) -> None:
+        logging.debug(f"[Client {self.cid}] set_parameters")
+        deserializedBytesParameters = deserializeToBytes(parameters)
+        deserializedParams = deserialize(deserializedBytesParameters, ts.context_from(public_context))
+        private_context = ts.context_from(secret_context)
+        decryptedParams = plain(deserializedParams, private_context)
+        params_dict = zip(self.net.state_dict().keys(), decryptedParams)
+        state_dict = {k: torch.Tensor(v) for k, v in params_dict}
+        self.net.load_state_dict(state_dict)
 
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
-    return train_loader, val_loader, test_dataset
+    def fit(self, parameters, config) -> fl.common.FitRes:
+        logging.debug(f"[Client {self.cid}] fit")
+        self.set_parameters(parameters)
+        self.train_local(self.net, self.trainloader, 1, self.criterion, self.optimizer, torch.device("cpu"))
+        ndarrays_updated = [param.cpu().detach().numpy() for param in self.net.parameters()]
+        encryptedParameters = cipher(ndarrays_updated, ts.context_from(public_context))
+        return encryptedParameters, len(self.trainloader.dataset), {}
 
-def client_fn(partition_id):
-    train_loader, val_loader, test_dataset = load_datasets(partition_id)
+    def evaluate(self, parameters: Parameters, config) -> fl.common.EvaluateRes:
+        logging.debug(f"[Client {self.cid}] Starting evaluation.")
+        self.set_parameters(parameters)
+        loss, accuracy = evaluate_model(self.net, self.testloader, self.criterion, torch.device("cpu"))
+        logging.debug(f"[Client {self.cid}] Evaluation completed. Loss: {loss}, Accuracy: {accuracy}")
+        return loss, len(self.testloader.dataset), {}
 
-    model = CNN()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-
-    context = ts.context(ts.SCHEME_TYPE.CKKS, poly_modulus_degree=8192, coeff_mod_bit_sizes=[60, 40, 40, 60])
-    context.global_scale = 2**40
-    context.generate_galois_keys()
-
-    def encrypt_parameters(parameters, context, batch_size=256):  # Batch size modificabile
-        encrypted_parameters = []
-        for param in tqdm(parameters, desc="Encrypting Parameters"):
-            param_flat = param.flatten().tolist()
-            encrypted_batches = []
-            for i in range(0, len(param_flat), batch_size):
-                batch = param_flat[i:i+batch_size]
-                encrypted_tensor = ts.ckks_vector(context, batch)
-                encrypted_batches.append(encrypted_tensor.serialize())
-            encrypted_parameters.append((encrypted_batches, param.shape))
-        return encrypted_parameters
-
-    def decrypt_parameters(encrypted_parameters, context, batch_size=256):  # Batch size modificabile
-        decrypted_parameters = []
-        for enc_batches, shape in tqdm(encrypted_parameters, desc="Decrypting Parameters"):
-            decrypted_flat = []
-            for enc_batch in enc_batches:
-                enc_tensor = ts.ckks_vector_from(context, enc_batch)
-                decrypted_flat.extend(enc_tensor.decrypt())
-            decrypted_tensor = torch.tensor(decrypted_flat).reshape(shape)
-            decrypted_parameters.append(decrypted_tensor)
-        return decrypted_parameters
-
-    def serialize_parameters(encrypted_parameters):
-        return pickle.dumps(encrypted_parameters)
-
-    def deserialize_parameters(serialized_parameters):
-        return pickle.loads(serialized_parameters)
-
-    class FlowerClient(fl.client.NumPyClient):
-        def get_parameters(self, config=None):
-            parameters = [val.cpu().numpy() for val in model.state_dict().values()]
-            encrypted_params = encrypt_parameters(parameters, context)
-            serialized_encrypted_params = serialize_parameters(encrypted_params)
-            return [np.frombuffer(serialized_encrypted_params, dtype=np.uint8)]
-
-        def set_parameters(self, parameters):
-            serialized_encrypted_params = parameters[0].tobytes()
-            encrypted_params = deserialize_parameters(serialized_encrypted_params)
-            decrypted_params = decrypt_parameters(encrypted_params, context)
-            params_dict = zip(model.state_dict().keys(), decrypted_params)
-            state_dict = {k: v.clone().detach() for k, v in params_dict}
-            model.load_state_dict(state_dict, strict=True)
-
-        def fit(self, parameters, config):
-            self.set_parameters(parameters)
-            model.train()
-            total_loss = 0
-            for epoch in tqdm(range(1), desc="Training Epochs"):
-                for batch_idx, (data, target) in tqdm(enumerate(train_loader), desc="Training Batches", total=len(train_loader)):
-                    optimizer.zero_grad()
-                    output = model(data)
-                    loss = F.nll_loss(output, target)
-                    total_loss += loss.item() * len(data)
-                    loss.backward()
-                    optimizer.step()
-            average_loss = total_loss / len(train_loader.dataset)
-            return self.get_parameters(), len(train_loader.dataset), {"loss": average_loss}
-
-        def evaluate(self, parameters, config):
-            self.set_parameters(parameters)
-            model.eval()
-            test_loader = DataLoader(test_dataset, batch_size=16)
-            total_loss = 0
-            with torch.no_grad():
-                for data, target in tqdm(test_loader, desc="Evaluating Batches"):
-                    encrypted_data = ts.ckks_vector(context, data.flatten().tolist())
-                    encrypted_output = model(encrypted_data)
-                    decrypted_output = encrypted_output.decrypt()
-                    loss = F.nll_loss(torch.tensor(decrypted_output), target)
-                    total_loss += loss.item()
-            return float(total_loss) / len(test_loader), len(test_loader.dataset), {"loss": float(total_loss) / len(test_loader.dataset)}
-
-    return FlowerClient()
+    def train_local(self, model, trainloader, epochs, criterion, optimizer, device):
+        model.train()
+        for epoch in range(epochs):
+            for data, labels in trainloader:
+                data, labels = data.to(device), labels.to(device)
+                optimizer.zero_grad()
+                outputs = model(data)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Flower Client")
-    parser.add_argument("--partition-id", type=int, required=True, help="Partition ID")
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Federated Learning Client")
+    parser.add_argument("--partition-id", type=int, required=True, help="ID of the partition to use")
     args = parser.parse_args()
 
-    fl.client.start_client(
-        server_address="localhost:8080",
-        client=client_fn(args.partition_id).to_client(),
-    )
+    # Load dataset and create dataloaders
+    mnist_train = datasets.MNIST('data', train=True, download=True, transform=transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ]))
+    mnist_test = datasets.MNIST('data', train=False, download=True, transform=transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ]))
+
+    trainset_partitions = torch.utils.data.random_split(mnist_train, [len(mnist_train) // 5] * 5)
+    trainloaders = [DataLoader(partition, batch_size=16, shuffle=True) for partition in trainset_partitions]
+    testloader = DataLoader(mnist_test, batch_size=16, shuffle=False)
+
+    # Create model, criterion, and optimizer
+    net = Net()
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(net.parameters(), lr=0.001)
+    # Start the Flower client
+    fl.client.start_client(server_address="localhost:8080", client=fl.client.NumPyClient.to_client(FlowerClient(str(args.partition_id), trainloaders[args.partition_id], testloader, net, criterion, optimizer)))
