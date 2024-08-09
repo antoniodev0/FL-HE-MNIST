@@ -35,7 +35,10 @@ public_context = context.serialize()
 
 # Check if a variable is a list or a np.ndarray
 def isList(arrayList):
-    return isinstance(arrayList, (list, np.ndarray))
+    if type(arrayList) == list or type(arrayList) == np.ndarray:
+        return True
+    else:
+        return False
 
 # Encrypt data function
 def cipher(values, context):
