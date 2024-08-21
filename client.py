@@ -82,7 +82,7 @@ class HomomorphicFlowerClient(fl.client.NumPyClient):
 
 def train(net, trainloader, epochs):
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
+    optimizer = optim.Adam(net.parameters(), lr=0.001, momentum=0.9)
     net.train()
     for _ in range(epochs):
         for images, labels in trainloader:
