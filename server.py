@@ -1,6 +1,5 @@
 import flwr as fl
 from flwr.server.strategy import FedAvg
-
 import tenseal as ts
 import numpy as np
 import pickle
@@ -13,33 +12,33 @@ context = ts.context_from(public_context)
 
 class HomomorphicFedAvg(FedAvg):
     def aggregate_fit(self, server_round, results, failures):
-        """Aggregate model parameters using homomorphic encryption."""
         if not results:
             return None, {}
 
-        # Deserializza i parametri cifrati in CKKSVector e collega il contesto
         encrypted_params = []
-        for _, fit_res in results:
+        weights = []
+        for client, fit_res in results:
             client_params = []
             for param in fl.common.parameters_to_ndarrays(fit_res.parameters):
                 ckks_vector = ts.lazy_ckks_vector_from(param.tobytes())
-                ckks_vector.link_context(context)  # Collegare il contesto dopo la deserializzazione
+                ckks_vector.link_context(context)
+                
+                # Accedi a partition_id dalle metrics
+                partition_id = fit_res.metrics["partition_id"]
+                print(f"Encrypted parameter received on server (partition_id {partition_id}): {ckks_vector}")
+
                 client_params.append(ckks_vector)
             encrypted_params.append(client_params)
+            weights.append(fit_res.num_examples)
 
-        # Somma i parametri cifrati di tutti i client
-        aggregated_params = encrypted_params[0]
-        for client_params in encrypted_params[1:]:
+        total_examples = sum(weights)
+        normalized_weights = [w / total_examples for w in weights]
+
+        aggregated_params = [param * normalized_weights[0] for param in encrypted_params[0]]
+        for client_params, weight in zip(encrypted_params[1:], normalized_weights[1:]):
             for i in range(len(aggregated_params)):
-                aggregated_params[i] += client_params[i]
+                aggregated_params[i] += client_params[i] * weight
 
-        # Dividi per il numero di client moltiplicando per l'inverso
-        num_clients = len(encrypted_params)
-        inverse_num_clients = 1.0 / num_clients  # Calcola l'inverso
-        for i in range(len(aggregated_params)):
-            aggregated_params[i] = aggregated_params[i] * inverse_num_clients  # Moltiplica per l'inverso
-
-        # Serializza i parametri aggregati e ritorna come Parameters
         aggregated_serialized = [param.serialize() for param in aggregated_params]
         return fl.common.ndarrays_to_parameters(aggregated_serialized), {}
 
@@ -48,12 +47,17 @@ class HomomorphicFedAvg(FedAvg):
         if not results:
             return None, {}
 
-        # Aggrega la perdita (val_loss) in chiaro dei client
+        # Aggrega la perdita (val_loss) e l'accuratezza in chiaro dei client
         total_loss = sum(r.metrics["val_loss"] * r.num_examples for _, r in results)
+        total_accuracy = sum(r.metrics["accuracy"] * r.num_examples for _, r in results)
         total_samples = sum(r.num_examples for _, r in results)
-        average_loss = total_loss / total_samples
 
-        return average_loss, {}
+        average_loss = total_loss / total_samples
+        average_accuracy = total_accuracy / total_samples
+
+        print(f"Round {server_round} - Average loss: {average_loss:.4f}, Average accuracy: {average_accuracy:.4f}")
+
+        return average_loss, {"accuracy": average_accuracy}
 
 def main():
     strategy = HomomorphicFedAvg(
@@ -66,7 +70,7 @@ def main():
 
     fl.server.start_server(
         server_address="localhost:8080",
-        config=fl.server.ServerConfig(num_rounds=3),
+        config=fl.server.ServerConfig(num_rounds=20),
         strategy=strategy,
     )
 
