@@ -72,13 +72,13 @@ class HomomorphicFlowerClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-        train(self.net, self.trainloader, epochs=1)
-        return self.get_parameters(config={}), len(self.trainloader.dataset), {}
+        train(self.net, self.trainloader, epochs=5)
+        return self.get_parameters(config={}), len(self.trainloader.dataset), {"partition_id": self.cid}
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
-        val_loss = test(self.net, self.valloader)
-        return float(val_loss), len(self.valloader.dataset), {"val_loss": float(val_loss)}
+        val_loss, accuracy = test(self.net, self.valloader)
+        return float(val_loss), len(self.valloader.dataset), {"val_loss": float(val_loss), "accuracy": float(accuracy)}
 
 def train(net, trainloader, epochs):
     criterion = nn.CrossEntropyLoss()
@@ -96,13 +96,19 @@ def test(net, testloader):
     criterion = nn.CrossEntropyLoss()
     net.eval()
     val_loss = 0.0
+    correct = 0
+    total = 0
     with torch.no_grad():
         for images, labels in testloader:
             outputs = net(images)
             val_loss += criterion(outputs, labels).item()
-    return val_loss / len(testloader)
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+    accuracy = correct / total
+    return val_loss / len(testloader), accuracy
 
-def load_data(partition_id):
+def load_data(partition_id, num_partitions=30):
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
@@ -111,10 +117,12 @@ def load_data(partition_id):
     mnist_train = datasets.MNIST('data', train=True, download=True, transform=transform)
     mnist_test = datasets.MNIST('data', train=False, download=True, transform=transform)
     
-    # Partiziona il dataset in base a partition_id
-    n_partitions = 5
-    partition_size = len(mnist_train) // n_partitions
-    partition = random_split(mnist_train, [partition_size] * n_partitions)[partition_id]
+    # Partiziona il dataset in 30 parti
+    partition_size = len(mnist_train) // num_partitions
+    partitions = random_split(mnist_train, [partition_size] * num_partitions)
+    
+    # Seleziona la partizione per questo client
+    partition = partitions[partition_id]
     
     # Dividi in train (80%) e validation (20%)
     train_size = int(0.8 * len(partition))
