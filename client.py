@@ -8,6 +8,9 @@ import numpy as np
 import tenseal as ts
 import pickle
 import argparse
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
 
 # Carica il contesto TenSEAL
 with open("secret_context.pkl", "rb") as f:
@@ -72,17 +75,46 @@ class HomomorphicFlowerClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-        train(self.net, self.trainloader, epochs=5)
+        train(self.net, self.trainloader, epochs=3)
+        # Genera la confusion matrix alla fine del training
+        self.generate_confusion_matrix()
         return self.get_parameters(config={}), len(self.trainloader.dataset), {"partition_id": self.cid}
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         val_loss, accuracy = test(self.net, self.valloader)
         return float(val_loss), len(self.valloader.dataset), {"val_loss": float(val_loss), "accuracy": float(accuracy)}
+    def generate_confusion_matrix(self):
+        """Genera e salva la matrice di confusione per questo client."""
+        all_preds = []
+        all_labels = []
+
+        # Ottieni le predizioni e le etichette vere
+        self.net.eval()
+        with torch.no_grad():
+            for images, labels in self.valloader:
+                outputs = self.net(images)
+                _, predicted = outputs.max(1)
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+
+        # Calcola la confusion matrix
+        cm = confusion_matrix(all_labels, all_preds)
+
+        # Visualizza la confusion matrix senza normalizzazione
+        plt.figure(figsize=(10, 7))
+        sns.heatmap(cm, annot=True, fmt="d", cmap='Blues')  # Usa 'fmt="d"' per valori interi
+        plt.ylabel('True label')
+        plt.xlabel('Predicted label')
+        plt.title(f'Confusion Matrix Client {self.cid} (Absolute Counts)')
+
+        # Salva l'immagine con il nome del client
+        plt.savefig(f'confusion_matrix_client_{self.cid}.png')
+        plt.close()
 
 def train(net, trainloader, epochs):
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(net.parameters(), lr=0.001, momentum=0.9)
+    optimizer = optim.Adam(net.parameters(), lr=0.001)
     net.train()
     for _ in range(epochs):
         for images, labels in trainloader:
@@ -108,7 +140,7 @@ def test(net, testloader):
     accuracy = correct / total
     return val_loss / len(testloader), accuracy
 
-def load_data(partition_id, num_partitions=30):
+def load_data(partition_id, num_partitions=5):
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
