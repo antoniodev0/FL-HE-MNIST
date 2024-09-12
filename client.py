@@ -11,7 +11,7 @@ import argparse
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
-
+import torch.nn.functional as F
 # Carica il contesto TenSEAL
 with open("secret_context.pkl", "rb") as f:
     secret_context = pickle.load(f)
@@ -22,21 +22,23 @@ context = ts.context_from(secret_context)
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(1, 6, 5)
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
         self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(6, 16, 5)
-        self.fc1 = nn.Linear(16 * 4 * 4, 120)
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, 10)
+        self.fc1 = nn.Linear(64 * 3 * 3, 64)
+        self.fc2 = nn.Linear(64, 10)
+        self.dropout = nn.Dropout(0.5)
 
     def forward(self, x):
-        x = self.pool(torch.relu(self.conv1(x)))
-        x = self.pool(torch.relu(self.conv2(x)))
-        x = x.view(-1, 16 * 4 * 4)
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = self.pool(F.relu(self.conv3(x)))
+        x = x.view(-1, 64 * 3 * 3)
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return F.log_softmax(x, dim=1)
 
 class HomomorphicFlowerClient(fl.client.NumPyClient):
     def __init__(self, cid, net, trainloader, valloader, testloader):
@@ -75,7 +77,7 @@ class HomomorphicFlowerClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-        train(self.net, self.trainloader, epochs=3)
+        train(self.net, self.trainloader, epochs=5)
         # Genera la confusion matrix alla fine del training
         self.generate_confusion_matrix()
         return self.get_parameters(config={}), len(self.trainloader.dataset), {"partition_id": self.cid}
@@ -114,7 +116,7 @@ class HomomorphicFlowerClient(fl.client.NumPyClient):
 
 def train(net, trainloader, epochs):
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(net.parameters(), lr=0.001)
+    optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
     net.train()
     for _ in range(epochs):
         for images, labels in trainloader:
@@ -140,7 +142,7 @@ def test(net, testloader):
     accuracy = correct / total
     return val_loss / len(testloader), accuracy
 
-def load_data(partition_id, num_partitions=5):
+def load_data(partition_id, num_partitions=20):
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
