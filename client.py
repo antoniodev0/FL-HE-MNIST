@@ -142,7 +142,7 @@ def test(net, testloader):
     accuracy = correct / total
     return val_loss / len(testloader), accuracy
 
-def load_data(partition_id, num_partitions=20):
+def load_data(partition_id, num_partitions=10):
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
